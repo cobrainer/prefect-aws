@@ -810,13 +810,14 @@ class ECSTask(Infrastructure):
             task_definition_arn=task_definition_arn,
         )
         self.logger.info(f"{self._log_prefix}: Creating task run...")
-        self.logger.debug("Task run payload\n" + yaml.dump(task_run))
+        self.logger.info("Task run payload\n" + yaml.dump(task_run))
 
         try:
             task = self._run_task(ecs_client, task_run)
             task_arn = task["taskArn"]
             cluster_arn = task["clusterArn"]
         except Exception as exc:
+            self.logger.info(f"EcsTaskException: {exc}")
             self._report_task_run_creation_failure(task_run, exc)
 
         # Raises an exception if the task does not start
@@ -1073,8 +1074,15 @@ class ECSTask(Infrastructure):
             if task["lastStatus"] == "STOPPED":
                 code = task.get("stopCode")
                 reason = task.get("stoppedReason")
-                # Generate a dynamic exception type from the AWS name
-                raise type(code, (RuntimeError,), {})(reason)
+
+                containers = task["containers"]
+                exit_codes = " ".join([container.get("exitCode", "?exitCode?") for container in containers])
+                try:
+                    # Generate a dynamic exception type from the AWS name
+                    raise type(code, (RuntimeError,), {})(f"{reason=} {exit_codes=}")
+                except Exception as exc:
+                    self.logger.info(f"EcsTaskException: {exc}")
+                    raise
 
         return task
 
