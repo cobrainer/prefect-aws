@@ -17,6 +17,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+## 0.4.7
+
+Released January 3rd, 2024.
+
+### Added
+
+- `LambdaFunction` block to invoke lambda functions - [#355](https://github.com/PrefectHQ/prefect-aws/pull/355)
+
+### Fixed
+
+- Bug where `S3Bucket.load()` constructed `AwsCredentials` instead of `MinIOCredentials` - [#359](https://github.com/PrefectHQ/prefect-aws/pull/359)
+
+## 0.4.6
+
+Released December 11th, 2023.
+
+### Added
+
+Ability to publish `ECSTask`` block as an ecs work pool - [#353](https://github.com/PrefectHQ/prefect-aws/pull/353)
+
+## 0.4.5
+
+Released November 30th, 2023.
+
+### Fixed
+
+- Bug where Prefect API key provided to ECS tasks was masked - [#347](https://github.com/PrefectHQ/prefect-aws/pull/347)
+
+## 0.4.4
+
+Released November 29th, 2023.
+
+### Changed
+
+- Mask Prefect API key in logs - [#341](https://github.com/PrefectHQ/prefect-aws/pull/341)
+
+## 0.4.3
+
+Released November 13th, 2023.
+
+### Added
+
+- `SecretBrinary` suport to `AwsSecret` block - [#274](https://github.com/PrefectHQ/prefect-aws/pull/274)
+
+## 0.4.2
+
+Released November 6th, 2023.
+
+### Fixed
+
+- Fixed use_ssl default for s3 client.
+
 ## 0.4.1
 
 Released October 13th, 2023.
