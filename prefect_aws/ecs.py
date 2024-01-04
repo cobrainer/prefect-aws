@@ -273,6 +273,8 @@ class ECSTask(Infrastructure):
         task_start_timeout_seconds: The amount of time to watch for the
             start of the ECS task before marking it as failed. The task must
             enter a RUNNING state to be considered started.
+        task_finish_timeout_seconds: The amount of time to watch for finishing of the ECS task
+            before marking it as failed.
         task_watch_poll_interval: The amount of time to wait between AWS API
             calls while monitoring the state of an ECS task.
     """
@@ -463,6 +465,15 @@ class ECSTask(Infrastructure):
             "considered started."
         ),
     )
+
+    task_finish_timeout_seconds: int = Field(
+        default=3600,
+        description=(
+            "The amount of time to watch for the end of the ECS task "
+            "before marking it as failed."
+        ),
+    )
+
     task_watch_poll_interval: float = Field(
         default=5.0,
         description=(
@@ -1216,7 +1227,11 @@ class ECSTask(Infrastructure):
                 )
 
         for task in self._watch_task_run(
-            task_arn, cluster_arn, ecs_client, current_status="RUNNING"
+            task_arn,
+            cluster_arn,
+            ecs_client,
+            current_status="RUNNING",
+            timeout=self.task_finish_timeout_seconds,
         ):
             if self.stream_output and can_stream_output:
                 # On each poll for task run status, also retrieve available logs
