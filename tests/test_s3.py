@@ -8,7 +8,6 @@ from botocore.exceptions import ClientError, EndpointConnectionError
 from moto import mock_s3
 from prefect import flow
 from prefect.deployments import Deployment
-from pytest_lazyfixture import lazy_fixture
 
 from prefect_aws import AwsCredentials, MinIOCredentials
 from prefect_aws.client_parameters import AwsClientParameters
@@ -22,9 +21,9 @@ from prefect_aws.s3 import (
 )
 
 aws_clients = [
-    (lazy_fixture("aws_client_parameters_custom_endpoint")),
-    (lazy_fixture("aws_client_parameters_empty")),
-    (lazy_fixture("aws_client_parameters_public_bucket")),
+    "aws_client_parameters_custom_endpoint",
+    "aws_client_parameters_empty",
+    "aws_client_parameters_public_bucket",
 ]
 
 
@@ -38,7 +37,7 @@ def s3_mock(monkeypatch, client_parameters):
 
 @pytest.fixture
 def client_parameters(request):
-    client_parameters = request.param
+    client_parameters = request.getfixturevalue(request.param)
     return client_parameters
 
 
@@ -114,7 +113,7 @@ def a_lot_of_objects(bucket, tmp_path):
 
 @pytest.mark.parametrize(
     "client_parameters",
-    [lazy_fixture("aws_client_parameters_custom_endpoint")],
+    ["aws_client_parameters_custom_endpoint"],
     indirect=True,
 )
 async def test_s3_download_failed_with_wrong_endpoint_setup(
@@ -141,30 +140,30 @@ async def test_s3_download_failed_with_wrong_endpoint_setup(
     "client_parameters",
     [
         pytest.param(
-            lazy_fixture("aws_client_parameters_custom_endpoint"),
+            "aws_client_parameters_custom_endpoint",
             marks=pytest.mark.is_public(False),
         ),
         pytest.param(
-            lazy_fixture("aws_client_parameters_custom_endpoint"),
+            "aws_client_parameters_custom_endpoint",
             marks=pytest.mark.is_public(True),
         ),
         pytest.param(
-            lazy_fixture("aws_client_parameters_empty"),
+            "aws_client_parameters_empty",
             marks=pytest.mark.is_public(False),
         ),
         pytest.param(
-            lazy_fixture("aws_client_parameters_empty"),
+            "aws_client_parameters_empty",
             marks=pytest.mark.is_public(True),
         ),
         pytest.param(
-            lazy_fixture("aws_client_parameters_public_bucket"),
+            "aws_client_parameters_public_bucket",
             marks=[
                 pytest.mark.is_public(False),
                 pytest.mark.xfail(reason="Bucket is not a public one"),
             ],
         ),
         pytest.param(
-            lazy_fixture("aws_client_parameters_public_bucket"),
+            "aws_client_parameters_public_bucket",
             marks=pytest.mark.is_public(True),
         ),
     ],
@@ -1004,6 +1003,42 @@ class TestS3Bucket:
         assert s3_bucket_2_empty.read_path("object_copy_4") == b"TEST"
 
     @pytest.mark.parametrize("client_parameters", aws_clients[-1:], indirect=True)
+    @pytest.mark.parametrize(
+        "to_bucket, bucket_folder, expected_path",
+        [
+            # to_bucket=None uses the s3_bucket_2_empty fixture
+            (None, None, "object"),
+            (None, "subfolder", "subfolder/object"),
+            ("bucket_2", None, "object"),
+            (None, None, "object"),
+            (None, "subfolder", "subfolder/object"),
+            ("bucket_2", None, "object"),
+        ],
+    )
+    def test_copy_subpaths(
+        self,
+        s3_bucket_with_object: S3Bucket,
+        s3_bucket_2_empty: S3Bucket,
+        to_bucket,
+        bucket_folder,
+        expected_path,
+    ):
+        if to_bucket is None:
+            to_bucket = s3_bucket_2_empty
+            if bucket_folder is not None:
+                to_bucket.bucket_folder = bucket_folder
+            else:
+                # For testing purposes, don't use bucket folder unless specified
+                to_bucket.bucket_folder = None
+
+        key = s3_bucket_with_object.copy_object(
+            "object",
+            "object",
+            to_bucket=to_bucket,
+        )
+        assert key == expected_path
+
+    @pytest.mark.parametrize("client_parameters", aws_clients[-1:], indirect=True)
     def test_move_object_within_bucket(
         self,
         s3_bucket_with_object: S3Bucket,
@@ -1047,3 +1082,39 @@ class TestS3Bucket:
 
         with pytest.raises(ClientError):
             assert s3_bucket_with_object.read_path("object") == b"TEST"
+
+    @pytest.mark.parametrize("client_parameters", aws_clients[-1:], indirect=True)
+    @pytest.mark.parametrize(
+        "to_bucket, bucket_folder, expected_path",
+        [
+            # to_bucket=None uses the s3_bucket_2_empty fixture
+            (None, None, "object"),
+            (None, "subfolder", "subfolder/object"),
+            ("bucket_2", None, "object"),
+            (None, None, "object"),
+            (None, "subfolder", "subfolder/object"),
+            ("bucket_2", None, "object"),
+        ],
+    )
+    def test_move_subpaths(
+        self,
+        s3_bucket_with_object: S3Bucket,
+        s3_bucket_2_empty: S3Bucket,
+        to_bucket,
+        bucket_folder,
+        expected_path,
+    ):
+        if to_bucket is None:
+            to_bucket = s3_bucket_2_empty
+            if bucket_folder is not None:
+                to_bucket.bucket_folder = bucket_folder
+            else:
+                # For testing purposes, don't use bucket folder unless specified
+                to_bucket.bucket_folder = None
+
+        key = s3_bucket_with_object.move_object(
+            "object",
+            "object",
+            to_bucket=to_bucket,
+        )
+        assert key == expected_path

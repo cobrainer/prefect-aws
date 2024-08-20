@@ -3,9 +3,11 @@ import logging
 from functools import partial
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 from unittest.mock import ANY, MagicMock
+from unittest.mock import patch as mock_patch
 from uuid import uuid4
 
 import anyio
+import botocore
 import pytest
 import yaml
 from moto import mock_ec2, mock_ecs, mock_logs
@@ -19,12 +21,12 @@ if PYDANTIC_VERSION.startswith("2."):
 else:
     from pydantic import ValidationError
 
-from tenacity import RetryError
-
+from prefect_aws.credentials import _get_client_cached
 from prefect_aws.workers.ecs_worker import (
     _TASK_DEFINITION_CACHE,
     ECS_DEFAULT_CONTAINER_NAME,
     ECS_DEFAULT_CPU,
+    ECS_DEFAULT_FAMILY,
     ECS_DEFAULT_MEMORY,
     AwsCredentials,
     ECSJobConfiguration,
@@ -504,6 +506,7 @@ async def test_launch_types(
         # Instead, it requires a capacity provider strategy but this is not supported
         # by moto and is not present on the task even when provided so we assert on the
         # mock call to ensure it is sent
+
         assert mock_run_task.call_args[0][1].get("capacityProviderStrategy") == [
             {"capacityProvider": "FARGATE_SPOT", "weight": 1}
         ]
@@ -647,6 +650,7 @@ async def test_task_definition_arn(aws_credentials: AwsCredentials, flow_run: Fl
     _, task_arn = parse_identifier(result.identifier)
 
     task = describe_task(ecs_client, task_arn)
+    print(task)
     assert (
         task["taskDefinitionArn"] == task_definition_arn
     ), "The task definition should be used without registering a new one"
@@ -1320,9 +1324,55 @@ async def test_stream_output(
     # assert "test-message-{i}" in err
 
 
+orig = botocore.client.BaseClient._make_api_call
+
+
+def mock_make_api_call(self, operation_name, kwarg):
+    if operation_name == "RunTask":
+        return {
+            "failures": [
+                {"arn": "string", "reason": "string", "detail": "string"},
+            ]
+        }
+    return orig(self, operation_name, kwarg)
+
+
 @pytest.mark.usefixtures("ecs_mocks")
+async def test_run_task_error_handling(
+    aws_credentials: AwsCredentials,
+    flow_run: FlowRun,
+    capsys,
+):
+    configuration = await construct_configuration(
+        aws_credentials=aws_credentials,
+        task_role_arn="test",
+    )
+
+    with mock_patch(
+        "botocore.client.BaseClient._make_api_call", new=mock_make_api_call
+    ):
+        async with ECSWorker(work_pool_name="test") as worker:
+            with pytest.raises(RuntimeError, match="Failed to run ECS task") as exc:
+                await run_then_stop_task(worker, configuration, flow_run)
+
+    assert exc.value.args[0] == "Failed to run ECS task: string"
+
+
+@pytest.mark.usefixtures("ecs_mocks")
+@pytest.mark.parametrize(
+    "cloudwatch_logs_options",
+    [
+        {
+            "awslogs-stream-prefix": "override-prefix",
+            "max-buffer-size": "2m",
+        },
+        {
+            "max-buffer-size": "2m",
+        },
+    ],
+)
 async def test_cloudwatch_log_options(
-    aws_credentials: AwsCredentials, flow_run: FlowRun
+    aws_credentials: AwsCredentials, flow_run: FlowRun, cloudwatch_logs_options: dict
 ):
     session = aws_credentials.get_boto3_session()
     ecs_client = session.client("ecs")
@@ -1331,12 +1381,10 @@ async def test_cloudwatch_log_options(
         aws_credentials=aws_credentials,
         configure_cloudwatch_logs=True,
         execution_role_arn="test",
-        cloudwatch_logs_options={
-            "awslogs-stream-prefix": "override-prefix",
-            "max-buffer-size": "2m",
-        },
+        cloudwatch_logs_options=cloudwatch_logs_options,
     )
-    async with ECSWorker(work_pool_name="test") as worker:
+    work_pool_name = "test"
+    async with ECSWorker(work_pool_name=work_pool_name) as worker:
         result = await run_then_stop_task(worker, configuration, flow_run)
 
     assert result.status_code == 0
@@ -1346,6 +1394,9 @@ async def test_cloudwatch_log_options(
     task_definition = describe_task_definition(ecs_client, task)
 
     for container in task_definition["containerDefinitions"]:
+        prefix = f"prefect-logs_{work_pool_name}_{flow_run.deployment_id}"
+        if cloudwatch_logs_options.get("awslogs-stream-prefix"):
+            prefix = cloudwatch_logs_options["awslogs-stream-prefix"]
         if container["name"] == ECS_DEFAULT_CONTAINER_NAME:
             # Assert that the container has logging configured with user
             # provided options
@@ -1355,7 +1406,7 @@ async def test_cloudwatch_log_options(
                     "awslogs-create-group": "true",
                     "awslogs-group": "prefect",
                     "awslogs-region": "us-east-1",
-                    "awslogs-stream-prefix": "override-prefix",
+                    "awslogs-stream-prefix": prefix,
                     "max-buffer-size": "2m",
                 },
             }
@@ -1412,6 +1463,97 @@ async def test_deregister_task_definition_does_not_apply_to_linked_arn(
 
     task = describe_task(ecs_client, task_arn)
     describe_task_definition(ecs_client, task)["status"] == "ACTIVE"
+
+
+@pytest.mark.usefixtures("ecs_mocks")
+async def test_match_latest_revision_in_family(
+    aws_credentials: AwsCredentials, flow_run: FlowRun
+):
+    session = aws_credentials.get_boto3_session()
+    ecs_client = session.client("ecs")
+
+    configuration_1 = await construct_configuration(
+        aws_credentials=aws_credentials,
+    )
+
+    configuration_2 = await construct_configuration(
+        aws_credentials=aws_credentials,
+        execution_role_arn="test",
+    )
+
+    configuration_3 = await construct_configuration(
+        aws_credentials=aws_credentials,
+        match_latest_revision_in_family=True,
+        execution_role_arn="test",
+    )
+
+    # Let the first worker run and register two task definitions
+    async with ECSWorker(work_pool_name="test") as worker:
+        await run_then_stop_task(worker, configuration_1, flow_run)
+        result_1 = await run_then_stop_task(worker, configuration_2, flow_run)
+
+    # Start a new worker with an empty cache
+    async with ECSWorker(work_pool_name="test") as worker:
+        result_2 = await run_then_stop_task(worker, configuration_3, flow_run)
+
+    assert result_1.status_code == 0
+    _, task_arn_1 = parse_identifier(result_1.identifier)
+
+    assert result_2.status_code == 0
+    _, task_arn_2 = parse_identifier(result_2.identifier)
+
+    task_1 = describe_task(ecs_client, task_arn_1)
+    task_2 = describe_task(ecs_client, task_arn_2)
+
+    assert task_1["taskDefinitionArn"] == task_2["taskDefinitionArn"]
+    assert task_2["taskDefinitionArn"].endswith(":2")
+
+
+@pytest.mark.usefixtures("ecs_mocks")
+async def test_match_latest_revision_in_family_custom_family(
+    aws_credentials: AwsCredentials, flow_run: FlowRun
+):
+    session = aws_credentials.get_boto3_session()
+    ecs_client = session.client("ecs")
+
+    configuration_1 = await construct_configuration(
+        aws_credentials=aws_credentials,
+        family="test-family",
+    )
+
+    configuration_2 = await construct_configuration(
+        aws_credentials=aws_credentials,
+        execution_role_arn="test",
+        family="test-family",
+    )
+
+    configuration_3 = await construct_configuration(
+        aws_credentials=aws_credentials,
+        match_latest_revision_in_family=True,
+        execution_role_arn="test",
+        family="test-family",
+    )
+
+    # Let the first worker run and register two task definitions
+    async with ECSWorker(work_pool_name="test") as worker:
+        await run_then_stop_task(worker, configuration_1, flow_run)
+        result_1 = await run_then_stop_task(worker, configuration_2, flow_run)
+
+    # Start a new worker with an empty cache
+    async with ECSWorker(work_pool_name="test") as worker:
+        result_2 = await run_then_stop_task(worker, configuration_3, flow_run)
+
+    assert result_1.status_code == 0
+    _, task_arn_1 = parse_identifier(result_1.identifier)
+
+    assert result_2.status_code == 0
+    _, task_arn_2 = parse_identifier(result_2.identifier)
+
+    task_1 = describe_task(ecs_client, task_arn_1)
+    task_2 = describe_task(ecs_client, task_arn_2)
+
+    assert task_1["taskDefinitionArn"] == task_2["taskDefinitionArn"]
+    assert task_2["taskDefinitionArn"].endswith(":2")
 
 
 @pytest.mark.usefixtures("ecs_mocks")
@@ -1910,6 +2052,41 @@ async def test_user_defined_environment_variables_in_task_definition_template(
 
 
 @pytest.mark.usefixtures("ecs_mocks")
+async def test_user_defined_capacity_provider_strategy(
+    aws_credentials: AwsCredentials, flow_run: FlowRun
+):
+    configuration = await construct_configuration(
+        aws_credentials=aws_credentials,
+        capacity_provider_strategy=[
+            {"base": 0, "weight": 1, "capacityProvider": "r6i.large"}
+        ],
+    )
+    session = aws_credentials.get_boto3_session()
+    ecs_client = session.client("ecs")
+
+    async with ECSWorker(work_pool_name="test") as worker:
+        # Capture the task run call because moto does not track
+        # 'capacityProviderStrategy'
+        original_run_task = worker._create_task_run
+        mock_run_task = MagicMock(side_effect=original_run_task)
+        worker._create_task_run = mock_run_task
+
+        result = await run_then_stop_task(worker, configuration, flow_run)
+
+    assert result.status_code == 0
+    _, task_arn = parse_identifier(result.identifier)
+
+    task = describe_task(ecs_client, task_arn)
+    assert not task.get("launchType")
+    # Instead, it requires a capacity provider strategy but this is not supported
+    # by moto and is not present on the task even when provided so we assert on the
+    # mock call to ensure it is sent
+    assert mock_run_task.call_args[0][1].get("capacityProviderStrategy") == [
+        {"base": 0, "weight": 1, "capacityProvider": "r6i.large"},
+    ]
+
+
+@pytest.mark.usefixtures("ecs_mocks")
 async def test_user_defined_environment_variables_in_task_run_request_template(
     aws_credentials: AwsCredentials, flow_run: FlowRun
 ):
@@ -2176,11 +2353,30 @@ async def test_retry_on_failed_task_start(
         },
     )
 
-    with pytest.raises(RetryError):
+    with pytest.raises(RuntimeError):
         async with ECSWorker(work_pool_name="test") as worker:
             await run_then_stop_task(worker, configuration, flow_run)
 
     assert run_task_mock.call_count == 3
+
+
+@pytest.mark.usefixtures("ecs_mocks")
+async def test_worker_uses_cached_boto3_client(aws_credentials: AwsCredentials):
+    configuration = await construct_configuration(
+        aws_credentials=aws_credentials,
+    )
+
+    _get_client_cached.cache_clear()
+
+    assert _get_client_cached.cache_info().hits == 0, "Initial call count should be 0"
+
+    async with ECSWorker(work_pool_name="test") as worker:
+        worker._get_client(configuration, "ecs")
+        worker._get_client(configuration, "ecs")
+        worker._get_client(configuration, "ecs")
+
+    assert _get_client_cached.cache_info().misses == 1
+    assert _get_client_cached.cache_info().hits == 2
 
 
 async def test_mask_sensitive_env_values():
@@ -2205,3 +2401,27 @@ async def test_mask_sensitive_env_values():
         res["overrides"]["containerOverrides"][0]["environment"][1]["value"]
         == "NORMAL_VALUE"
     )
+
+
+@pytest.mark.usefixtures("ecs_mocks")
+async def test_get_or_generate_family(
+    aws_credentials: AwsCredentials, flow_run: FlowRun
+):
+    configuration = await construct_configuration(
+        aws_credentials=aws_credentials,
+    )
+
+    work_pool_name = "test"
+    session = aws_credentials.get_boto3_session()
+    ecs_client = session.client("ecs")
+    family = f"{ECS_DEFAULT_FAMILY}_{work_pool_name}_{flow_run.deployment_id}"
+
+    async with ECSWorker(work_pool_name=work_pool_name) as worker:
+        result = await run_then_stop_task(worker, configuration, flow_run)
+
+    assert result.status_code == 0
+    _, task_arn = parse_identifier(result.identifier)
+
+    task = describe_task(ecs_client, task_arn)
+    task_definition = describe_task_definition(ecs_client, task)
+    assert task_definition["family"] == family

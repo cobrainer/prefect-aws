@@ -51,12 +51,11 @@ import shlex
 import sys
 import time
 from copy import deepcopy
-from typing import Any, Dict, Generator, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, Generator, List, NamedTuple, Optional, Tuple, Union
 from uuid import UUID
 
 import anyio
 import anyio.abc
-import boto3
 import yaml
 from prefect.exceptions import InfrastructureNotAvailable, InfrastructureNotFound
 from prefect.server.schemas.core import FlowRun
@@ -71,15 +70,15 @@ from prefect.workers.base import (
 from pydantic import VERSION as PYDANTIC_VERSION
 
 if PYDANTIC_VERSION.startswith("2."):
-    from pydantic.v1 import Field, root_validator
+    from pydantic.v1 import BaseModel, Field, root_validator
 else:
-    from pydantic import Field, root_validator
+    from pydantic import Field, root_validator, BaseModel
 
 from slugify import slugify
 from tenacity import retry, stop_after_attempt, wait_fixed, wait_random
 from typing_extensions import Literal
 
-from prefect_aws import AwsCredentials
+from prefect_aws.credentials import AwsCredentials, ClientType
 
 # Internal type alias for ECS clients which are generated dynamically in botocore
 _ECSClient = Any
@@ -127,6 +126,7 @@ overrides:
   taskRoleArn: "{{ task_role_arn }}"
 tags: "{{ labels }}"
 taskDefinition: "{{ task_definition_arn }}"
+capacityProviderStrategy: "{{ capacity_provider_strategy }}"
 """
 
 # Create task run retry settings
@@ -246,6 +246,16 @@ def mask_api_key(task_run_request):
     )
 
 
+class CapacityProvider(BaseModel):
+    """
+    The capacity provider strategy to use when running the task.
+    """
+
+    capacityProvider: str
+    weight: int
+    base: int
+
+
 class ECSJobConfiguration(BaseJobConfiguration):
     """
     Job configuration for an ECS worker.
@@ -260,6 +270,7 @@ class ECSJobConfiguration(BaseJobConfiguration):
     )
     configure_cloudwatch_logs: Optional[bool] = Field(default=None)
     cloudwatch_logs_options: Dict[str, str] = Field(default_factory=dict)
+    cloudwatch_logs_prefix: Optional[str] = Field(default=None)
     network_configuration: Dict[str, Any] = Field(default_factory=dict)
     stream_output: Optional[bool] = Field(default=None)
     task_start_timeout_seconds: int = Field(default=300)
@@ -268,6 +279,7 @@ class ECSJobConfiguration(BaseJobConfiguration):
     vpc_id: Optional[str] = Field(default=None)
     container_name: Optional[str] = Field(default=None)
     cluster: Optional[str] = Field(default=None)
+    match_latest_revision_in_family: bool = Field(default=False)
 
     @root_validator
     def task_run_request_requires_arn_if_no_task_definition_given(cls, values) -> dict:
@@ -420,9 +432,17 @@ class ECSVariables(BaseVariables):
             description=(
                 "The type of ECS task run infrastructure that should be used. Note that"
                 " 'FARGATE_SPOT' is not a formal ECS launch type, but we will configure"
-                " the proper capacity provider stategy if set here."
+                " the proper capacity provider strategy if set here."
             ),
         )
+    )
+    capacity_provider_strategy: Optional[List[CapacityProvider]] = Field(
+        default_factory=list,
+        description=(
+            "The capacity provider strategy to use when running the task. "
+            "If a capacity provider strategy is specified, the selected launch"
+            " type will be ignored."
+        ),
     )
     image: Optional[str] = Field(
         default=None,
@@ -507,6 +527,16 @@ class ECSVariables(BaseVariables):
             " for available options. "
         ),
     )
+    cloudwatch_logs_prefix: Optional[str] = Field(
+        default=None,
+        description=(
+            "When `configure_cloudwatch_logs` is enabled, this setting may be used to"
+            " set a prefix for the log group. If not provided, the default prefix will"
+            " be `prefect-logs_<work_pool_name>_<deployment_id>`. If"
+            " `awslogs-stream-prefix` is present in `Cloudwatch logs options` this"
+            " setting will be ignored."
+        ),
+    )
 
     network_configuration: Dict[str, Any] = Field(
         default_factory=dict,
@@ -551,6 +581,16 @@ class ECSVariables(BaseVariables):
             "your AWS account, instead it will be marked as INACTIVE."
         ),
     )
+    match_latest_revision_in_family: bool = Field(
+        default=False,
+        description=(
+            "If enabled, the most recent active revision in the task definition "
+            "family will be compared against the desired ECS task configuration. "
+            "If they are equal, the existing task definition will be used instead "
+            "of registering a new one. If no family is specified the default family "
+            f'"{ECS_DEFAULT_FAMILY}" will be used.'
+        ),
+    )
 
 
 class ECSWorkerResult(BaseWorkerResult):
@@ -584,8 +624,8 @@ class ECSWorker(BaseWorker):
         """
         Runs a given flow run on the current worker.
         """
-        boto_session, ecs_client = await run_sync_in_worker_thread(
-            self._get_session_and_client, configuration
+        ecs_client = await run_sync_in_worker_thread(
+            self._get_client, configuration, "ecs"
         )
 
         logger = self.get_flow_run_logger(flow_run)
@@ -598,7 +638,6 @@ class ECSWorker(BaseWorker):
         ) = await run_sync_in_worker_thread(
             self._create_task_and_wait_for_start,
             logger,
-            boto_session,
             ecs_client,
             configuration,
             flow_run,
@@ -625,7 +664,6 @@ class ECSWorker(BaseWorker):
             cluster_arn,
             task_definition,
             is_new_task_definition and configuration.auto_deregister_task_definition,
-            boto_session,
             ecs_client,
         )
 
@@ -636,21 +674,17 @@ class ECSWorker(BaseWorker):
             status_code=status_code if status_code is not None else -1,
         )
 
-    def _get_session_and_client(
-        self,
-        configuration: ECSJobConfiguration,
-    ) -> Tuple[boto3.Session, _ECSClient]:
+    def _get_client(
+        self, configuration: ECSJobConfiguration, client_type: Union[str, ClientType]
+    ) -> _ECSClient:
         """
-        Retrieve a boto3 session and ECS client
+        Get a boto3 client of client_type. Will use a cached client if one exists.
         """
-        boto_session = configuration.aws_credentials.get_boto3_session()
-        ecs_client = boto_session.client("ecs")
-        return boto_session, ecs_client
+        return configuration.aws_credentials.get_client(client_type)
 
     def _create_task_and_wait_for_start(
         self,
         logger: logging.Logger,
-        boto_session: boto3.Session,
         ecs_client: _ECSClient,
         configuration: ECSJobConfiguration,
         flow_run: FlowRun,
@@ -668,55 +702,15 @@ class ECSWorker(BaseWorker):
         new_task_definition_registered = False
 
         if not task_definition_arn:
-            cached_task_definition_arn = _TASK_DEFINITION_CACHE.get(
-                flow_run.deployment_id
-            )
             task_definition = self._prepare_task_definition(
-                configuration, region=ecs_client.meta.region_name
+                configuration, region=ecs_client.meta.region_name, flow_run=flow_run
             )
-
-            if cached_task_definition_arn:
-                # Read the task definition to see if the cached task definition is valid
-                try:
-                    cached_task_definition = self._retrieve_task_definition(
-                        logger, ecs_client, cached_task_definition_arn
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to retrieve cached task definition"
-                        f" {cached_task_definition_arn!r}: {exc!r}"
-                    )
-                    # Clear from cache
-                    _TASK_DEFINITION_CACHE.pop(flow_run.deployment_id, None)
-                    cached_task_definition_arn = None
-                else:
-                    if not cached_task_definition["status"] == "ACTIVE":
-                        # Cached task definition is not active
-                        logger.warning(
-                            "Cached task definition"
-                            f" {cached_task_definition_arn!r} is not active"
-                        )
-                        _TASK_DEFINITION_CACHE.pop(flow_run.deployment_id, None)
-                        cached_task_definition_arn = None
-                    elif not self._task_definitions_equal(
-                        task_definition, cached_task_definition
-                    ):
-                        # Cached task definition is not valid
-                        logger.warning(
-                            "Cached task definition"
-                            f" {cached_task_definition_arn!r} does not meet"
-                            " requirements"
-                        )
-                        _TASK_DEFINITION_CACHE.pop(flow_run.deployment_id, None)
-                        cached_task_definition_arn = None
-
-            if not cached_task_definition_arn:
-                task_definition_arn = self._register_task_definition(
-                    logger, ecs_client, task_definition
-                )
-                new_task_definition_registered = True
-            else:
-                task_definition_arn = cached_task_definition_arn
+            (
+                task_definition_arn,
+                new_task_definition_registered,
+            ) = self._get_or_register_task_definition(
+                logger, ecs_client, configuration, flow_run, task_definition
+            )
         else:
             task_definition = self._retrieve_task_definition(
                 logger, ecs_client, task_definition_arn
@@ -729,9 +723,6 @@ class ECSWorker(BaseWorker):
 
         self._validate_task_definition(task_definition, configuration)
 
-        # Update the cached task definition ARN to avoid re-registering the task
-        # definition on this worker unless necessary; registration is agressively
-        # rate limited by AWS
         _TASK_DEFINITION_CACHE[flow_run.deployment_id] = task_definition_arn
 
         logger.info(f"Using ECS task definition {task_definition_arn!r}...")
@@ -739,9 +730,7 @@ class ECSWorker(BaseWorker):
             f"Task definition {json.dumps(task_definition, indent=2, default=str)}"
         )
 
-        # Prepare the task run request
         task_run_request = self._prepare_task_run_request(
-            boto_session,
             configuration,
             task_definition,
             task_definition_arn,
@@ -761,7 +750,6 @@ class ECSWorker(BaseWorker):
             self._report_task_run_creation_failure(configuration, task_run_request, exc)
             raise
 
-        # Raises an exception if the task does not start
         logger.info("Waiting for ECS task run to start...")
         self._wait_for_task_start(
             logger,
@@ -774,6 +762,65 @@ class ECSWorker(BaseWorker):
 
         return task_arn, cluster_arn, task_definition, new_task_definition_registered
 
+    def _get_or_register_task_definition(
+        self,
+        logger: logging.Logger,
+        ecs_client: _ECSClient,
+        configuration: ECSJobConfiguration,
+        flow_run: FlowRun,
+        task_definition: dict,
+    ) -> Tuple[str, bool]:
+        """Get or register a task definition for the given flow run.
+
+        Returns a tuple of the task definition ARN and a bool indicating if the task
+        definition is newly registered.
+        """
+
+        cached_task_definition_arn = _TASK_DEFINITION_CACHE.get(flow_run.deployment_id)
+        new_task_definition_registered = False
+
+        if cached_task_definition_arn:
+            try:
+                cached_task_definition = self._retrieve_task_definition(
+                    logger, ecs_client, cached_task_definition_arn
+                )
+                if not cached_task_definition[
+                    "status"
+                ] == "ACTIVE" or not self._task_definitions_equal(
+                    task_definition, cached_task_definition
+                ):
+                    cached_task_definition_arn = None
+            except Exception:
+                cached_task_definition_arn = None
+
+        if (
+            not cached_task_definition_arn
+            and configuration.match_latest_revision_in_family
+        ):
+            family_name = task_definition.get("family", ECS_DEFAULT_FAMILY)
+            try:
+                task_definition_from_family = self._retrieve_task_definition(
+                    logger, ecs_client, family_name
+                )
+                if task_definition_from_family and self._task_definitions_equal(
+                    task_definition, task_definition_from_family
+                ):
+                    cached_task_definition_arn = task_definition_from_family[
+                        "taskDefinitionArn"
+                    ]
+            except Exception:
+                cached_task_definition_arn = None
+
+        if not cached_task_definition_arn:
+            task_definition_arn = self._register_task_definition(
+                logger, ecs_client, task_definition
+            )
+            new_task_definition_registered = True
+        else:
+            task_definition_arn = cached_task_definition_arn
+
+        return task_definition_arn, new_task_definition_registered
+
     def _watch_task_and_get_exit_code(
         self,
         logger: logging.Logger,
@@ -782,7 +829,6 @@ class ECSWorker(BaseWorker):
         cluster_arn: str,
         task_definition: dict,
         deregister_task_definition: bool,
-        boto_session: boto3.Session,
         ecs_client: _ECSClient,
     ) -> Optional[int]:
         """
@@ -798,7 +844,6 @@ class ECSWorker(BaseWorker):
             cluster_arn,
             task_definition,
             ecs_client,
-            boto_session,
         )
 
         if deregister_task_definition:
@@ -938,15 +983,19 @@ class ECSWorker(BaseWorker):
         self,
         logger: logging.Logger,
         ecs_client: _ECSClient,
-        task_definition_arn: str,
+        task_definition: str,
     ):
         """
         Retrieve an existing task definition from AWS.
         """
-        logger.info(f"Retrieving ECS task definition {task_definition_arn!r}...")
-        response = ecs_client.describe_task_definition(
-            taskDefinition=task_definition_arn
-        )
+        if task_definition.startswith("arn:aws:ecs:"):
+            logger.info(f"Retrieving ECS task definition {task_definition!r}...")
+        else:
+            logger.info(
+                "Retrieving most recent active revision from "
+                f"ECS task family {task_definition!r}..."
+            )
+        response = ecs_client.describe_task_definition(taskDefinition=task_definition)
         return response["taskDefinition"]
 
     def _wait_for_task_start(
@@ -992,7 +1041,6 @@ class ECSWorker(BaseWorker):
         cluster_arn: str,
         task_definition: dict,
         ecs_client: _ECSClient,
-        boto_session: boto3.Session,
     ):
         """
         Watch an ECS task until it reaches a STOPPED status.
@@ -1031,7 +1079,7 @@ class ECSWorker(BaseWorker):
             else:
                 # Prepare to stream the output
                 log_config = container_def["logConfiguration"]["options"]
-                logs_client = boto_session.client("logs")
+                logs_client = self._get_client(configuration, "logs")
                 can_stream_output = True
                 # Track the last log timestamp to prevent double display
                 last_log_timestamp: Optional[int] = None
@@ -1187,10 +1235,28 @@ class ECSWorker(BaseWorker):
                 )
             time.sleep(configuration.task_watch_poll_interval)
 
+    def _get_or_generate_family(self, task_definition: dict, flow_run: FlowRun) -> str:
+        """
+        Gets or generate a family for the task definition.
+        """
+        family = task_definition.get("family")
+        if not family:
+            assert self._work_pool_name and flow_run.deployment_id
+            family = (
+                f"{ECS_DEFAULT_FAMILY}_{self._work_pool_name}_{flow_run.deployment_id}"
+            )
+        slugify(
+            family,
+            max_length=255,
+            regex_pattern=r"[^a-zA-Z0-9-_]+",
+        )
+        return family
+
     def _prepare_task_definition(
         self,
         configuration: ECSJobConfiguration,
         region: str,
+        flow_run: FlowRun,
     ) -> dict:
         """
         Prepare a task definition by inferring any defaults and merging overrides.
@@ -1240,24 +1306,23 @@ class ECSWorker(BaseWorker):
                 container["environment"].remove(item)
 
         if configuration.configure_cloudwatch_logs:
+            prefix = f"prefect-logs_{self._work_pool_name}_{flow_run.deployment_id}"
             container["logConfiguration"] = {
                 "logDriver": "awslogs",
                 "options": {
                     "awslogs-create-group": "true",
                     "awslogs-group": "prefect",
                     "awslogs-region": region,
-                    "awslogs-stream-prefix": configuration.name or "prefect",
+                    "awslogs-stream-prefix": (
+                        configuration.cloudwatch_logs_prefix or prefix
+                    ),
                     **configuration.cloudwatch_logs_options,
                 },
             }
 
-        family = task_definition.get("family") or ECS_DEFAULT_FAMILY
-        task_definition["family"] = slugify(
-            family,
-            max_length=255,
-            regex_pattern=r"[^a-zA-Z0-9-_]+",
+        task_definition["family"] = self._get_or_generate_family(
+            task_definition, flow_run
         )
-
         # CPU and memory are required in some cases, retrieve the value to use
         cpu = task_definition.get("cpu") or ECS_DEFAULT_CPU
         memory = task_definition.get("memory") or ECS_DEFAULT_MEMORY
@@ -1300,13 +1365,13 @@ class ECSWorker(BaseWorker):
         return task_definition
 
     def _load_network_configuration(
-        self, vpc_id: Optional[str], boto_session: boto3.Session
+        self, vpc_id: Optional[str], configuration: ECSJobConfiguration
     ) -> dict:
         """
         Load settings from a specific VPC or the default VPC and generate a task
         run request's network configuration.
         """
-        ec2_client = boto_session.client("ec2")
+        ec2_client = self._get_client(configuration, "ec2")
         vpc_message = "the default VPC" if not vpc_id else f"VPC with ID {vpc_id}"
 
         if not vpc_id:
@@ -1347,13 +1412,16 @@ class ECSWorker(BaseWorker):
         }
 
     def _custom_network_configuration(
-        self, vpc_id: str, network_configuration: dict, boto_session: boto3.Session
+        self,
+        vpc_id: str,
+        network_configuration: dict,
+        configuration: ECSJobConfiguration,
     ) -> dict:
         """
         Load settings from a specific VPC or the default VPC and generate a task
         run request's network configuration.
         """
-        ec2_client = boto_session.client("ec2")
+        ec2_client = self._get_client(configuration, "ec2")
         vpc_message = f"VPC with ID {vpc_id}"
 
         vpcs = ec2_client.describe_vpcs(VpcIds=[vpc_id]).get("Vpcs")
@@ -1389,7 +1457,6 @@ class ECSWorker(BaseWorker):
 
     def _prepare_task_run_request(
         self,
-        boto_session: boto3.Session,
         configuration: ECSJobConfiguration,
         task_definition: dict,
         task_definition_arn: str,
@@ -1401,17 +1468,24 @@ class ECSWorker(BaseWorker):
 
         task_run_request.setdefault("taskDefinition", task_definition_arn)
         assert task_run_request["taskDefinition"] == task_definition_arn
+        capacityProviderStrategy = task_run_request.get("capacityProviderStrategy")
 
-        if task_run_request.get("launchType") == "FARGATE_SPOT":
+        if capacityProviderStrategy:
+            # Should not be provided at all if capacityProviderStrategy is set, see https://docs.aws.amazon.com/AmazonECS/latest/APIReference/API_RunTask.html#ECS-RunTask-request-capacityProviderStrategy  # noqa
+            self._logger.warning(
+                "Found capacityProviderStrategy. "
+                "Removing launchType from task run request."
+            )
+            task_run_request.pop("launchType", None)
+
+        elif task_run_request.get("launchType") == "FARGATE_SPOT":
             # Should not be provided at all for FARGATE SPOT
             task_run_request.pop("launchType", None)
 
             # A capacity provider strategy is required for FARGATE SPOT
-            task_run_request.setdefault(
-                "capacityProviderStrategy",
-                [{"capacityProvider": "FARGATE_SPOT", "weight": 1}],
-            )
-
+            task_run_request["capacityProviderStrategy"] = [
+                {"capacityProvider": "FARGATE_SPOT", "weight": 1}
+            ]
         overrides = task_run_request.get("overrides", {})
         container_overrides = overrides.get("containerOverrides", [])
 
@@ -1422,7 +1496,7 @@ class ECSWorker(BaseWorker):
             and not configuration.network_configuration
         ):
             task_run_request["networkConfiguration"] = self._load_network_configuration(
-                configuration.vpc_id, boto_session
+                configuration.vpc_id, configuration
             )
 
         # Use networkConfiguration if supplied by user
@@ -1435,7 +1509,7 @@ class ECSWorker(BaseWorker):
                 self._custom_network_configuration(
                     configuration.vpc_id,
                     configuration.network_configuration,
-                    boto_session,
+                    configuration,
                 )
             )
 
@@ -1547,6 +1621,7 @@ class ECSWorker(BaseWorker):
             CREATE_TASK_RUN_MIN_DELAY_JITTER_SECONDS,
             CREATE_TASK_RUN_MAX_DELAY_JITTER_SECONDS,
         ),
+        reraise=True,
     )
     def _create_task_run(self, ecs_client: _ECSClient, task_run_request: dict) -> str:
         """
@@ -1554,7 +1629,16 @@ class ECSWorker(BaseWorker):
 
         Returns the task run ARN.
         """
-        return ecs_client.run_task(**task_run_request)["tasks"][0]
+        task = ecs_client.run_task(**task_run_request)
+        if task["failures"]:
+            raise RuntimeError(
+                f"Failed to run ECS task: {task['failures'][0]['reason']}"
+            )
+        elif not task["tasks"]:
+            raise RuntimeError(
+                "Failed to run ECS task: no tasks or failures were returned."
+            )
+        return task["tasks"][0]
 
     def _task_definitions_equal(self, taskdef_1, taskdef_2) -> bool:
         """
@@ -1628,7 +1712,7 @@ class ECSWorker(BaseWorker):
                 f"{cluster!r}."
             )
 
-        _, ecs_client = self._get_session_and_client(configuration)
+        ecs_client = self._get_client(configuration, "ecs")
         try:
             ecs_client.stop_task(cluster=cluster, task=task)
         except Exception as exc:
