@@ -292,6 +292,8 @@ class ECSTask(Infrastructure):
         task_start_timeout_seconds: The amount of time to watch for the
             start of the ECS task before marking it as failed. The task must
             enter a RUNNING state to be considered started.
+        task_finish_timeout_seconds: The amount of time to watch for finishing of the
+            ECS task before marking it as failed.
         task_watch_poll_interval: The amount of time to wait between AWS API
             calls while monitoring the state of an ECS task.
     """
@@ -482,6 +484,15 @@ class ECSTask(Infrastructure):
             "considered started."
         ),
     )
+
+    task_finish_timeout_seconds: int = Field(
+        default=3600,
+        description=(
+            "The amount of time to watch for the end of the ECS task "
+            "before marking it as failed."
+        ),
+    )
+
     task_watch_poll_interval: float = Field(
         default=5.0,
         description=(
@@ -925,7 +936,7 @@ class ECSTask(Infrastructure):
             task_arn = task["taskArn"]
             cluster_arn = task["clusterArn"]
         except Exception as exc:
-            self.logger.info(f"EcsTaskException: {exc}")
+            self.logger.error(f"EcsTaskException: {exc}")
             self._report_task_run_creation_failure(task_run, exc)
 
         # Raises an exception if the task does not start
@@ -1154,7 +1165,7 @@ class ECSTask(Infrastructure):
             else:
                 # Intermittently, the task will not be described. We wat to respect the
                 # watch timeout though.
-                self.logger.debug(f"{self._log_prefix}: Task not found.")
+                self.logger.warning(f"{self._log_prefix}: Task not found.")
 
             elapsed_time = time.time() - t0
             if timeout is not None and elapsed_time > timeout:
@@ -1184,12 +1195,17 @@ class ECSTask(Infrastructure):
                 reason = task.get("stoppedReason")
 
                 containers = task["containers"]
-                exit_codes = " ".join([container.get("exitCode", "?exitCode?") for container in containers])
+                exit_codes = " ".join(
+                    [
+                        container.get("exitCode", "?exitCode?")
+                        for container in containers
+                    ]
+                )
                 try:
                     # Generate a dynamic exception type from the AWS name
                     raise type(code, (RuntimeError,), {})(f"{reason=} {exit_codes=}")
                 except Exception as exc:
-                    self.logger.info(f"EcsTaskException: {exc}")
+                    self.logger.error(f"EcsTaskException: {exc}")
                     raise
 
         return task
@@ -1252,7 +1268,11 @@ class ECSTask(Infrastructure):
                 )
 
         for task in self._watch_task_run(
-            task_arn, cluster_arn, ecs_client, current_status="RUNNING"
+            task_arn,
+            cluster_arn,
+            ecs_client,
+            current_status="RUNNING",
+            timeout=self.task_finish_timeout_seconds,
         ):
             if self.stream_output and can_stream_output:
                 # On each poll for task run status, also retrieve available logs
